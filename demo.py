@@ -104,11 +104,18 @@ def _phase_end(agent_id: int, total: int, approved: int,
 
 def demo_init_rag():
     print(f"\n{'─'*W}")
-    print(f"  RAG 初始化  |  Milvus Lite 向量库 + 千问 text-embedding-v3 (1024-dim)")
+    print(f"  RAG 初始化  |  Milvus Lite + 千问 text-embedding-v3 (1024-dim)")
     print(f"{'─'*W}")
-    from rag.expense_rag import initialize
-    initialize()
-    print("  ✓ 就绪：12 条公司报销规定已向量化入库（rule_001 ~ rule_012）")
+
+    # 规则库：从 data/rules/*.txt 读取
+    from rag.expense_rag import initialize as init_rules
+    init_rules()
+    print("  ✓ 规则库就绪：data/rules/*.txt → Milvus expense_rules（12条 rule_001~rule_012）")
+
+    # 申请库：从 data/applications/*.txt 读取
+    from rag.application_rag import initialize as init_apps
+    init_apps()
+    print("  ✓ 申请库就绪：data/applications/*.txt → Milvus expense_applications（100条）")
 
 
 def demo_auto_approve(store: ApplicationStore) -> dict:

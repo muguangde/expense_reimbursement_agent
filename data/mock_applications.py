@@ -1,16 +1,26 @@
 """
-生成100条测试报销申请，分布如下：
-  - 1~80:  AUTO_APPROVE  — 金额<1000元，票据完整，各项合规 → 系统自动审批
-  - 81~90: PIPELINE      — 金额1000~5000元，合规 → 上级+财务审批后通过
-  - 91~95: HUMAN_REVIEW  — 边缘情况（略超标准 / 票据存疑）→ 标记人工审核
-  - 96~100: REJECT       — 明显违规（缺票、严重超标、类别错误）→ 退回
+报销申请数据层
+
+数据来源优先级：
+  1. data/applications/*.txt 文件（主要来源，解析为 dict）
+  2. 若 txt 文件不存在，回退到内存生成（兼容旧逻辑）
+
+批次分布（100条）：
+  - EXP0001~0080: AUTO_APPROVE  — 金额<1000元，票据完整，各项合规
+  - EXP0081~0090: PIPELINE      — 金额1000~5000元，合规，走完整审批
+  - EXP0091~0095: HUMAN_REVIEW  — 边缘情况，标记人工审核
+  - EXP0096~0100: REJECT        — 明显违规，退回
 """
 
+import os
+import re
 import random
 from datetime import datetime, timedelta
 from typing import List, Dict
 
 random.seed(42)
+
+APPS_DIR = os.path.join(os.path.dirname(__file__), "applications")
 
 EMPLOYEES = [
     {"name": "张伟",   "dept": "技术部",   "level": "P5"},
@@ -373,41 +383,115 @@ REJECT_CASES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 主生成函数
+# txt 文件解析（主路径）
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_mock_applications() -> List[Dict]:
-    apps = []
 
-    # Group 1: 1~80 auto-approve
+def _parse_app_txt(text: str, fname: str) -> Dict:
+    """将单个申请 txt 文件内容解析为 pipeline 所需的 dict 格式。"""
+
+    def _field(key: str, default: str = "") -> str:
+        m = re.search(rf"^{re.escape(key)}:\s*(.+)$", text, re.MULTILINE)
+        return m.group(1).strip() if m else default
+
+    def _bool_field(key: str) -> bool:
+        return _field(key) == "是"
+
+    # 解析费用明细行: "  [住宿费] 280元  有发票  宁波连锁酒店"
+    expense_items = []
+    for line in text.splitlines():
+        m = re.match(r"\s+\[(.+?)\]\s+(\d+)元\s+(有发票|无发票)\s*(.*)", line)
+        if m:
+            expense_items.append({
+                "category":    m.group(1),
+                "amount":      float(m.group(2)),
+                "has_receipt": m.group(3) == "有发票",
+                "note":        m.group(4).strip(),
+            })
+
+    total_str = _field("合计").replace("元", "")
+    try:
+        total = float(total_str)
+    except ValueError:
+        total = sum(i["amount"] for i in expense_items)
+
+    app_id = _field("申请编号") or fname.replace(".txt", "")
+
+    return {
+        "app_id":                    app_id,
+        "applicant":                 _field("申请人"),
+        "department":                _field("部门"),
+        "level":                     _field("级别"),
+        "destination":               _field("目的地"),
+        "trip_start":                _field("出差开始"),
+        "trip_end":                  _field("出差结束"),
+        "trip_days":                 int(_field("出差天数", "1")),
+        "purpose":                   _field("出差目的"),
+        "submitted_days_after_trip": int(_field("提交天数", "1")),
+        "expense_items":             expense_items,
+        "total_amount":              total,
+        "has_all_receipts":          _bool_field("票据完整"),
+        "within_limits":             _bool_field("各项合规"),
+        "justification":             _field("申请说明"),
+        "expected_outcome":          _field("预期结果"),
+        "reject_reason":             _field("拒绝原因"),
+    }
+
+
+def load_from_txt() -> List[Dict]:
+    """
+    从 data/applications/*.txt 读取所有申请（主路径）。
+    按 app_id 排序返回。
+    """
+    if not os.path.isdir(APPS_DIR):
+        raise FileNotFoundError(f"申请目录不存在: {APPS_DIR}")
+
+    apps = []
+    for fname in sorted(os.listdir(APPS_DIR)):
+        if not fname.endswith(".txt"):
+            continue
+        fpath = os.path.join(APPS_DIR, fname)
+        with open(fpath, encoding="utf-8") as f:
+            content = f.read().strip()
+        apps.append(_parse_app_txt(content, fname))
+    return apps
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 主入口（优先 txt 文件，回退到内存生成）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_mock_applications() -> List[Dict]:
+    """
+    优先从 data/applications/*.txt 读取，txt 不存在时回退到内存生成。
+    """
+    if os.path.isdir(APPS_DIR) and any(f.endswith(".txt") for f in os.listdir(APPS_DIR)):
+        apps = load_from_txt()
+        return apps
+
+    # 回退：内存生成
+    apps = []
     for i in range(1, 81):
         apps.append(_gen_auto_approve(i))
-
-    # Group 2: 81~90 pipeline approve
     for i in range(81, 91):
         apps.append(_gen_pipeline_approve(i))
-
-    # Group 3: 91~95 human review
     apps.extend(HUMAN_REVIEW_CASES)
-
-    # Group 4: 96~100 reject
     apps.extend(REJECT_CASES)
-
     return apps
 
 
 if __name__ == "__main__":
     apps = generate_mock_applications()
+    source = "txt文件" if os.path.isdir(APPS_DIR) else "内存生成"
     from collections import Counter
     outcomes = Counter(a["expected_outcome"] for a in apps)
-    print(f"总计生成: {len(apps)} 条申请")
+    print(f"数据来源: {source}")
+    print(f"总计: {len(apps)} 条申请")
     for outcome, count in sorted(outcomes.items()):
         print(f"  {outcome:<25} {count} 条")
     print(f"\n示例 (AUTO_APPROVE):")
     a = apps[0]
     print(f"  {a['app_id']} | {a['applicant']} | {a['department']} | {a['destination']} | {a['total_amount']}元")
-    print(f"\n示例 (HUMAN_REVIEW):")
-    a = apps[90]
-    print(f"  {a['app_id']} | {a['applicant']} | {a['total_amount']}元 | {a.get('justification','')[:40]}")
-    print(f"\n示例 (REJECTED):")
-    a = apps[95]
-    print(f"  {a['app_id']} | {a['applicant']} | 原因: {a.get('reject_reason','')[:50]}")
+    if len(apps) > 90:
+        print(f"\n示例 (HUMAN_REVIEW):")
+        a = apps[90]
+        print(f"  {a['app_id']} | {a['applicant']} | {a['total_amount']}元 | {a.get('justification','')[:40]}")
