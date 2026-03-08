@@ -96,7 +96,7 @@ with st.sidebar:
 
     page = st.radio(
         "导航",
-        ["📊 仪表板", "📋 申请列表", "🔍 人工审核", "🤖 触发 Agent", "🔎 RAG 搜索"],
+        ["📊 仪表板", "💬 报销发起助手", "📋 申请列表", "🔍 人工审核", "🤖 触发 Agent", "🔎 RAG 搜索"],
         label_visibility="collapsed",
     )
 
@@ -206,6 +206,195 @@ if page == "📊 仪表板":
             <code style="font-size:10px">{tech}</code></div>""",
             unsafe_allow_html=True,
         )
+
+# ─── 申请列表 ──────────────────────────────────────────────────────────────────
+
+# ─── 报销发起助手（Agent 1 对话）─────────────────────────────────────────────
+
+elif page == "💬 报销发起助手":
+    st.title("💬 报销发起助手 — Agent 1")
+    st.caption("对话式报销申请助手：引导填写申请、回答政策问题、自动核查合规性")
+
+    # 初始化 session 状态
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []          # [{"role", "content"}]
+    if "chat_draft" not in st.session_state:
+        st.session_state["chat_draft"] = None          # 申请草稿 dict
+    if "chat_submitted" not in st.session_state:
+        st.session_state["chat_submitted"] = False
+
+    # ── 布局：左侧对话 | 右侧申请草稿 ──────────────────────────────────────
+    col_chat, col_draft = st.columns([3, 2])
+
+    with col_chat:
+        st.subheader("与 Agent 1 对话")
+
+        # 快捷提示按钮
+        st.markdown("**快捷提问：**")
+        q_cols = st.columns(3)
+        quick_qs = [
+            "上海出差3天住宿标准是多少？",
+            "我要发起一笔报销申请",
+            "餐饮费发票丢了怎么办？",
+        ]
+        for i, (qcol, qq) in enumerate(zip(q_cols, quick_qs)):
+            if qcol.button(qq, key=f"qq_{i}", use_container_width=True):
+                st.session_state["_pending_input"] = qq
+
+        st.divider()
+
+        # 显示历史消息
+        chat_container = st.container(height=420)
+        with chat_container:
+            if not st.session_state["chat_history"]:
+                st.markdown(
+                    """
+                    <div style='text-align:center;color:#999;padding:60px 0'>
+                    👋 你好！我是报销发起助手。<br/>
+                    你可以问我报销政策，或者告诉我你要发起一笔报销申请。
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            for msg in st.session_state["chat_history"]:
+                with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🤖"):
+                    st.markdown(msg["content"])
+
+        # 输入框
+        pending = st.session_state.pop("_pending_input", None)
+        user_input = st.chat_input("输入问题或报销信息…", key="chat_input")
+        if pending and not user_input:
+            user_input = pending
+
+        if user_input and not st.session_state["chat_submitted"]:
+            # 显示用户消息
+            st.session_state["chat_history"].append({"role": "user", "content": user_input})
+
+            # 调用 Agent 1
+            from crews.chat_crew import chat as agent_chat
+            with st.spinner("Agent 1 思考中…"):
+                reply, draft = agent_chat(
+                    st.session_state["chat_history"][:-1],
+                    user_input,
+                )
+
+            st.session_state["chat_history"].append({"role": "assistant", "content": reply})
+
+            if draft:
+                st.session_state["chat_draft"] = draft
+
+            st.rerun()
+
+        # 清空对话按钮
+        if st.button("🗑 清空对话", use_container_width=True):
+            st.session_state["chat_history"] = []
+            st.session_state["chat_draft"] = None
+            st.session_state["chat_submitted"] = False
+            st.rerun()
+
+    # ── 右侧：申请草稿面板 ───────────────────────────────────────────────────
+    with col_draft:
+        st.subheader("📋 申请草稿")
+
+        draft = st.session_state.get("chat_draft")
+
+        if not draft:
+            st.info("与助手对话后，申请草稿将在此自动生成。")
+            st.markdown("**填写指引：**")
+            st.markdown("""
+- 告诉我你的**姓名、部门**
+- 说明**目的地**和**出差日期**
+- 列出**各项费用**（住宿/餐饮/交通）
+- 说明**是否有发票**
+            """)
+        else:
+            submitted = st.session_state.get("chat_submitted", False)
+
+            # 基本信息
+            st.markdown(f"**申请人**: {draft.get('applicant', '—')} ({draft.get('department', '—')} / {draft.get('level', '—')})")
+            st.markdown(f"**目的地**: {draft.get('destination', '—')}")
+            st.markdown(f"**出差日期**: {draft.get('trip_start', '—')} ~ {draft.get('trip_end', '—')} ({draft.get('trip_days', '—')} 天)")
+            st.markdown(f"**出差目的**: {draft.get('purpose', '—')}")
+
+            st.divider()
+
+            # 费用明细
+            items = draft.get("expense_items", [])
+            if items:
+                df_items = pd.DataFrame(items)
+                if "has_receipt" in df_items.columns:
+                    df_items["has_receipt"] = df_items["has_receipt"].map({True: "✓", False: "✗"})
+                st.dataframe(df_items, use_container_width=True, hide_index=True, height=150)
+
+            total = draft.get("total_amount", sum(i.get("amount", 0) for i in items))
+            st.markdown(f"**合计**: ¥{total:.0f}")
+
+            # 问题提示
+            issues = draft.get("issues", [])
+            if issues:
+                st.warning("**存在问题：**\n" + "\n".join(f"- {i}" for i in issues))
+            elif draft.get("ready_to_submit"):
+                st.success("✅ 材料完整，可以提交")
+
+            # 超标说明
+            justification = draft.get("justification", "")
+            if justification:
+                st.markdown(f"**超标说明**: {justification}")
+
+            st.divider()
+
+            if not submitted:
+                # 提交按钮
+                if st.button("🚀 提交申请到审批流水线", type="primary", use_container_width=True):
+                    from crews.chat_crew import build_app_from_draft
+                    from state.store import STATUS_PENDING_AUTO
+
+                    # 生成申请编号
+                    existing = [r["app_id"] for r in store.all()]
+                    chat_ids = [x for x in existing if x.startswith("CHT")]
+                    next_num = len(chat_ids) + 1
+                    new_id = f"CHT{next_num:04d}"
+
+                    app_data = build_app_from_draft(draft, new_id)
+
+                    # 写入 store
+                    store._store[new_id] = {
+                        **app_data,
+                        "status": STATUS_PENDING_AUTO,
+                        "history": [],
+                        "manager_decision": None,
+                        "finance_decision": None,
+                    }
+                    st.session_state["apps_map"][new_id] = app_data
+
+                    # 运行自动审批
+                    from pipeline import run_auto_approve_batch
+                    run_auto_approve_batch(store)
+
+                    new_status = store.get(new_id)["status"]
+                    st.session_state["chat_submitted"] = True
+
+                    st.success(f"✅ 申请已提交！编号: **{new_id}**")
+                    st.info(f"自动审批结果: **{STATUS_LABELS.get(new_status, new_status)}**")
+                    if new_status in ("PENDING_MANAGER", "PENDING_AUTO_CHECK"):
+                        st.markdown("→ 已进入 **经理初审** 队列，可在「触发 Agent」页面手动运行审批。")
+                    st.rerun()
+            else:
+                st.success("✅ 申请已提交，请在「申请列表」中查看状态。")
+
+                # 查找刚提交的申请
+                chat_records = [r for r in store.all() if r["app_id"].startswith("CHT")]
+                if chat_records:
+                    latest = max(chat_records, key=lambda x: x["app_id"])
+                    st.markdown(f"**申请编号**: `{latest['app_id']}`")
+                    st.markdown(f"**当前状态**: {STATUS_LABELS.get(latest['status'], latest['status'])}")
+
+                if st.button("📝 发起新申请", use_container_width=True):
+                    st.session_state["chat_history"] = []
+                    st.session_state["chat_draft"] = None
+                    st.session_state["chat_submitted"] = False
+                    st.rerun()
+
 
 # ─── 申请列表 ──────────────────────────────────────────────────────────────────
 
