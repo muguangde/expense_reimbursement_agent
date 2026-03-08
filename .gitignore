@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Milvus DB (可本地重建，不需入库)
+rag/*.db
+rag/*.db.lock
+
+# 运行状态（每次运行重新生成）
+state/applications.json
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
