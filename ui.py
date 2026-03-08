@@ -96,7 +96,16 @@ with st.sidebar:
 
     page = st.radio(
         "导航",
-        ["📊 仪表板", "💬 报销发起助手", "📋 申请列表", "🔍 人工审核", "🤖 触发 Agent", "🔎 RAG 搜索"],
+        [
+            "📊 仪表板",
+            "💬 报销发起助手",
+            "👔 经理初审助手",
+            "💼 财务审批助手",
+            "📋 申请列表",
+            "🔍 人工审核",
+            "🤖 触发 Agent",
+            "🔎 RAG 搜索",
+        ],
         label_visibility="collapsed",
     )
 
@@ -394,6 +403,275 @@ elif page == "💬 报销发起助手":
                     st.session_state["chat_draft"] = None
                     st.session_state["chat_submitted"] = False
                     st.rerun()
+
+
+# ─── Agent 2：经理初审助手 ────────────────────────────────────────────────────
+
+elif page == "👔 经理初审助手":
+    st.title("👔 经理初审助手 — Agent 2")
+    st.caption("部门经理初审智能体：对话式审批、政策查询、引用规则编号决策")
+
+    # session 初始化
+    for key, default in [("mgr_history", []), ("mgr_decisions", [])]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    # 待审批申请（实时从 store 读）
+    pending_mgr = store.get_by_status(STATUS_PENDING_MANAGER)
+
+    col_chat, col_panel = st.columns([3, 2])
+
+    with col_chat:
+        st.subheader("与经理初审 Agent 对话")
+
+        # 快捷指令
+        q_cols = st.columns(3)
+        mgr_qs = [
+            f"帮我审批 {pending_mgr[0]['app_id']}" if pending_mgr else "查看待审批申请",
+            "查询住宿费超标的处理规定",
+            "批量审核所有待审申请",
+        ]
+        for i, (qcol, qq) in enumerate(zip(q_cols, mgr_qs)):
+            if qcol.button(qq, key=f"mq_{i}", use_container_width=True):
+                st.session_state["_mgr_pending_input"] = qq
+
+        st.divider()
+
+        # 对话历史
+        chat_container = st.container(height=400)
+        with chat_container:
+            if not st.session_state["mgr_history"]:
+                pending_count = len(pending_mgr)
+                st.markdown(
+                    f"""<div style='text-align:center;color:#999;padding:50px 0'>
+                    👔 经理初审 Agent 就绪<br/>
+                    当前待审批申请: <b>{pending_count} 条</b><br/>
+                    可询问我审批任意申请，或查询相关报销规定。
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+            for msg in st.session_state["mgr_history"]:
+                avatar = "👤" if msg["role"] == "user" else "👔"
+                with st.chat_message(msg["role"], avatar=avatar):
+                    st.markdown(msg["content"])
+
+        # 输入
+        mgr_pending = st.session_state.pop("_mgr_pending_input", None)
+        mgr_input = st.chat_input("向经理 Agent 提问或发出审批指令…", key="mgr_chat_input")
+        if mgr_pending and not mgr_input:
+            mgr_input = mgr_pending
+
+        if mgr_input:
+            st.session_state["mgr_history"].append({"role": "user", "content": mgr_input})
+
+            # 构建 apps_map（含 manager_decision 字段）
+            full_apps_map = {}
+            for rec in store.all():
+                app_id = rec["app_id"]
+                base = apps_map.get(app_id, {})
+                full_apps_map[app_id] = {**base, **rec}
+
+            from crews.chat_crew import chat_manager
+            with st.spinner("经理 Agent 分析中（查询规定 + RAG）…"):
+                reply, decisions = chat_manager(
+                    st.session_state["mgr_history"][:-1],
+                    mgr_input,
+                    pending_mgr,
+                    full_apps_map,
+                )
+
+            st.session_state["mgr_history"].append({"role": "assistant", "content": reply})
+
+            # 执行审批决定
+            for dec in decisions:
+                app_id  = dec["app_id"]
+                decision = dec["decision"]
+                reason   = dec["reason"]
+                rec = store.get(app_id)
+                if rec and rec["status"] == STATUS_PENDING_MANAGER:
+                    if decision == "APPROVED":
+                        store.manager_approve(app_id, reason, detail=dec)
+                    elif decision == "REJECTED":
+                        store.manager_reject(app_id, reason)
+                    else:
+                        store.manager_flag_human(app_id, reason)
+                    st.session_state["mgr_decisions"].append({**dec, "executed": True})
+
+            st.rerun()
+
+        if st.button("🗑 清空对话", key="mgr_clear", use_container_width=True):
+            st.session_state["mgr_history"] = []
+            st.session_state["mgr_decisions"] = []
+            st.rerun()
+
+    with col_panel:
+        st.subheader("📋 待审批申请")
+        pending_mgr_fresh = store.get_by_status(STATUS_PENDING_MANAGER)
+        if not pending_mgr_fresh:
+            st.success("✅ 当前无待经理审批申请")
+        else:
+            for rec in pending_mgr_fresh[:8]:
+                color = "#FFF3E0"
+                issues = [] if rec.get("all_items_compliant") else ["有超标项"]
+                if not rec.get("has_all_receipts"):
+                    issues.append("票据不全")
+                badge = "  ".join(f"⚠️{i}" for i in issues) if issues else "✅ 基本合规"
+                st.markdown(
+                    f"""<div style='background:{color};padding:8px 12px;border-radius:6px;margin-bottom:6px;font-size:13px'>
+                    <b>{rec['app_id']}</b> {rec.get('applicant','')} ({rec.get('department','')})<br/>
+                    {rec.get('destination','')} · ¥{rec.get('total_amount',0):.0f} · {badge}
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+        st.subheader("✅ 本次已审批")
+        exec_decisions = st.session_state.get("mgr_decisions", [])
+        if not exec_decisions:
+            st.caption("（Agent 做出决定后显示在此）")
+        for dec in exec_decisions[-6:]:
+            color = {"APPROVED": "#E8F5E9", "REJECTED": "#FFEBEE", "PENDING_HUMAN_REVIEW": "#EDE7F6"}.get(dec["decision"], "#FFF")
+            icon  = {"APPROVED": "✅", "REJECTED": "❌", "PENDING_HUMAN_REVIEW": "🔍"}.get(dec["decision"], "")
+            st.markdown(
+                f"""<div style='background:{color};padding:6px 10px;border-radius:5px;margin-bottom:4px;font-size:12px'>
+                {icon} <b>{dec['app_id']}</b> → {dec['decision']}<br/>
+                <span style='color:#555'>{dec['reason'][:80]}…</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+
+# ─── Agent 3：财务审批助手 ────────────────────────────────────────────────────
+
+elif page == "💼 财务审批助手":
+    st.title("💼 财务审批助手 — Agent 3")
+    st.caption("财务审批智能体：终审决策、预算查询、合规性核查、引用规则编号")
+
+    # session 初始化
+    for key, default in [("fin_history", []), ("fin_decisions", [])]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    pending_fin = store.get_by_status(STATUS_PENDING_FINANCE)
+
+    col_chat, col_panel = st.columns([3, 2])
+
+    with col_chat:
+        st.subheader("与财务审批 Agent 对话")
+
+        # 快捷指令
+        q_cols = st.columns(3)
+        fin_qs = [
+            f"审批 {pending_fin[0]['app_id']}" if pending_fin else "查看待审批申请",
+            "查询销售部当前预算",
+            "超标申请如何处理？",
+        ]
+        for i, (qcol, qq) in enumerate(zip(q_cols, fin_qs)):
+            if qcol.button(qq, key=f"fq_{i}", use_container_width=True):
+                st.session_state["_fin_pending_input"] = qq
+
+        st.divider()
+
+        # 对话历史
+        chat_container = st.container(height=400)
+        with chat_container:
+            if not st.session_state["fin_history"]:
+                pending_count = len(pending_fin)
+                st.markdown(
+                    f"""<div style='text-align:center;color:#999;padding:50px 0'>
+                    💼 财务审批 Agent 就绪<br/>
+                    当前待财务终审: <b>{pending_count} 条</b><br/>
+                    可询问我终审任意申请，或查询预算/合规规定。
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+            for msg in st.session_state["fin_history"]:
+                avatar = "👤" if msg["role"] == "user" else "💼"
+                with st.chat_message(msg["role"], avatar=avatar):
+                    st.markdown(msg["content"])
+
+        # 输入
+        fin_pending = st.session_state.pop("_fin_pending_input", None)
+        fin_input = st.chat_input("向财务 Agent 提问或发出终审指令…", key="fin_chat_input")
+        if fin_pending and not fin_input:
+            fin_input = fin_pending
+
+        if fin_input:
+            st.session_state["fin_history"].append({"role": "user", "content": fin_input})
+
+            full_apps_map = {}
+            for rec in store.all():
+                app_id = rec["app_id"]
+                base = apps_map.get(app_id, {})
+                full_apps_map[app_id] = {**base, **rec}
+
+            from crews.chat_crew import chat_finance
+            with st.spinner("财务 Agent 分析中（查询规定 + 预算 + RAG）…"):
+                reply, decisions = chat_finance(
+                    st.session_state["fin_history"][:-1],
+                    fin_input,
+                    pending_fin,
+                    full_apps_map,
+                )
+
+            st.session_state["fin_history"].append({"role": "assistant", "content": reply})
+
+            # 执行终审决定
+            for dec in decisions:
+                app_id   = dec["app_id"]
+                decision = dec["decision"]
+                reason   = dec["reason"]
+                rec = store.get(app_id)
+                if rec and rec["status"] == STATUS_PENDING_FINANCE:
+                    if decision == "APPROVED":
+                        store.finance_approve(app_id, reason, detail=dec)
+                    elif decision == "REJECTED":
+                        store.finance_reject(app_id, reason)
+                    else:
+                        store.finance_flag_human(app_id, reason)
+                    st.session_state["fin_decisions"].append({**dec, "executed": True})
+
+            st.rerun()
+
+        if st.button("🗑 清空对话", key="fin_clear", use_container_width=True):
+            st.session_state["fin_history"] = []
+            st.session_state["fin_decisions"] = []
+            st.rerun()
+
+    with col_panel:
+        st.subheader("📋 待财务终审申请")
+        pending_fin_fresh = store.get_by_status(STATUS_PENDING_FINANCE)
+        if not pending_fin_fresh:
+            st.success("✅ 当前无待财务终审申请")
+            st.info("💡 先在「经理初审助手」中完成初审，申请会进入此队列。")
+        else:
+            for rec in pending_fin_fresh[:8]:
+                mgr_dec = rec.get("manager_decision") or {}
+                mgr_result = mgr_dec.get("decision", "—")
+                st.markdown(
+                    f"""<div style='background:#E8EAF6;padding:8px 12px;border-radius:6px;margin-bottom:6px;font-size:13px'>
+                    <b>{rec['app_id']}</b> {rec.get('applicant','')} ({rec.get('department','')})<br/>
+                    {rec.get('destination','')} · ¥{rec.get('total_amount',0):.0f}<br/>
+                    经理初审: <span style='color:#1565C0'>{mgr_result}</span>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+        st.subheader("✅ 本次已终审")
+        exec_decisions = st.session_state.get("fin_decisions", [])
+        if not exec_decisions:
+            st.caption("（Agent 做出决定后显示在此）")
+        for dec in exec_decisions[-6:]:
+            color = {"APPROVED": "#E8F5E9", "REJECTED": "#FFEBEE", "PENDING_HUMAN_REVIEW": "#EDE7F6"}.get(dec["decision"], "#FFF")
+            icon  = {"APPROVED": "✅", "REJECTED": "❌", "PENDING_HUMAN_REVIEW": "🔍"}.get(dec["decision"], "")
+            st.markdown(
+                f"""<div style='background:{color};padding:6px 10px;border-radius:5px;margin-bottom:4px;font-size:12px'>
+                {icon} <b>{dec['app_id']}</b> → {dec['decision']}<br/>
+                <span style='color:#555'>{dec['reason'][:80]}…</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 
 # ─── 申请列表 ──────────────────────────────────────────────────────────────────

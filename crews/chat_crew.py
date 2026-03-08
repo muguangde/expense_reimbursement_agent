@@ -281,6 +281,389 @@ def _extract_draft(text: str) -> dict | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent 2 — 部门经理初审智能体 对话模式
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MANAGER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_policy",
+            "description": "查询公司差旅报销规定，获取适用规则条文（住宿/餐饮/票据/时限等）。审批前必须先查询。",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "查询关键词"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_app_detail",
+            "description": "获取某条待审批申请的完整详情（费用明细、申请人信息、历史记录等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"app_id": {"type": "string", "description": "申请编号，如 EXP0081"}},
+                "required": ["app_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_decision",
+            "description": (
+                "对申请做出审批决定。decision 只能是 APPROVED / REJECTED / PENDING_HUMAN_REVIEW。"
+                "必须先查询相关规定再做决定，决定理由中必须引用规则编号。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_id":   {"type": "string", "description": "申请编号"},
+                    "decision": {"type": "string", "enum": ["APPROVED", "REJECTED", "PENDING_HUMAN_REVIEW"]},
+                    "reason":   {"type": "string", "description": "带规则编号的决定理由，至少50字"},
+                },
+                "required": ["app_id", "decision", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_similar_cases",
+            "description": "从历史申请库检索相似案例，为当前申请的审批提供参考依据。",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "场景描述"}},
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+_FINANCE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_policy",
+            "description": "查询公司报销规定（票据合规、金额限额、财务审计要求等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_budget",
+            "description": "查询部门预算使用情况（已用额度、剩余额度、使用率）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"department": {"type": "string", "description": "部门名称"}},
+                "required": ["department"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_app_detail",
+            "description": "获取某条待财务审批申请的完整详情及经理初审意见。",
+            "parameters": {
+                "type": "object",
+                "properties": {"app_id": {"type": "string"}},
+                "required": ["app_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_similar_cases",
+            "description": "检索历史申请案例，参考类似情况的财务处理结果。",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_decision",
+            "description": (
+                "对申请作出财务终审决定。decision 只能是 APPROVED / REJECTED / PENDING_HUMAN_REVIEW。"
+                "必须先查询规定和预算后再决定，理由中引用规则编号并说明预算影响。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_id":   {"type": "string"},
+                    "decision": {"type": "string", "enum": ["APPROVED", "REJECTED", "PENDING_HUMAN_REVIEW"]},
+                    "reason":   {"type": "string", "description": "带规则编号和预算说明的终审理由"},
+                },
+                "required": ["app_id", "decision", "reason"],
+            },
+        },
+    },
+]
+
+
+def _build_manager_system_prompt(pending_list: str) -> str:
+    today = date.today().isoformat()
+    return f"""你是"部门经理初审智能体"，负责对下属提交的报销申请做初审，并与经理进行问答交流。
+
+今天日期: {today}
+
+## 当前待审批申请列表
+{pending_list if pending_list else "（当前无待审批申请）"}
+
+## 工作流程
+1. 当经理询问某条申请时，先调用 get_app_detail 获取详情
+2. 调用 search_policy 查询适用规定（住宿标准/票据要求/时限等）
+3. 如有疑问，可调用 search_similar_cases 参考历史案例
+4. 综合分析后，调用 make_decision 输出决定
+5. 向经理汇报分析要点和决定理由
+
+## 审批原则
+- **APPROVED**：所有项目符合规定，可转财务复核
+- **REJECTED**：存在明显违规（超标未申报、无发票、超时限），退回并引用规则编号
+- **PENDING_HUMAN_REVIEW**：边缘情况（超标有说明、金额大但合规），标记待人工复核
+
+## 重要约束
+- 住宿上限按城市等级：一线600元/晚，二线400元/晚，其他300元/晚（无职级区分）
+- 餐饮上限：150元/天（不分城市）
+- 报销时限：30天
+- 决定理由必须引用具体规则编号（rule_001~rule_012）
+- 可以回答经理关于报销政策的任何问题
+"""
+
+
+def _build_finance_system_prompt(pending_list: str) -> str:
+    today = date.today().isoformat()
+    return f"""你是"财务审批智能体"，负责对经部门经理初审通过的报销申请进行财务终审，并与财务人员进行问答交流。
+
+今天日期: {today}
+
+## 当前待财务审批申请列表
+{pending_list if pending_list else "（当前无待审批申请）"}
+
+## 工作流程
+1. 调用 get_app_detail 查看申请详情和经理初审意见
+2. 调用 check_budget 查询申请人所在部门的预算余额
+3. 调用 search_policy 查询适用财务规定
+4. 综合合规性 + 预算影响，调用 make_decision 输出终审决定
+5. 向财务人员汇报分析要点
+
+## 终审原则
+- **APPROVED**：合规且预算充足（使用率<85%），批准入账
+- **REJECTED**：存在财务违规（无发票/超标未申报），或预算严重超限
+- **PENDING_HUMAN_REVIEW**：预算使用率>85%、大额申请(>5000)、特殊超标有说明
+
+## 重要约束
+- 必须先查询预算再做决定，决定理由需说明预算影响
+- 必须引用规则编号
+- 可以回答财务人员关于报销合规、预算管理的任何问题
+"""
+
+
+def _format_pending_list(apps: list[dict], max_count: int = 15) -> str:
+    """将待审批申请格式化为系统提示词中的列表文本。"""
+    if not apps:
+        return "（无待审批申请）"
+    lines = []
+    for a in apps[:max_count]:
+        lines.append(
+            f"- {a['app_id']} | {a.get('applicant','')}"
+            f" ({a.get('department','')}) | {a.get('destination','')} "
+            f"| ¥{a.get('total_amount',0):.0f}"
+            f" | {'票据完整' if a.get('has_all_receipts') else '票据缺失'}"
+            f" | {'合规' if a.get('all_items_compliant') else '有超标项'}"
+        )
+    if len(apps) > max_count:
+        lines.append(f"  ...（另有 {len(apps)-max_count} 条未显示）")
+    return "\n".join(lines)
+
+
+def _execute_review_tool(name: str, args: dict, apps_map: dict, decisions: list) -> str:
+    """Agent 2/3 共用的工具执行器。"""
+    if name == "search_policy":
+        from rag.expense_rag import search
+        return search(args["query"], top_k=3)
+
+    elif name == "search_similar_cases":
+        try:
+            from rag.application_rag import search_similar
+            return search_similar(args["query"], top_k=3)
+        except Exception as e:
+            return f"历史案例检索暂不可用: {e}"
+
+    elif name == "check_budget":
+        from tools.budget_tool import DEPT_BUDGETS
+        dept = args["department"]
+        for key, val in DEPT_BUDGETS.items():
+            if dept in key or key in dept:
+                used = val.get("used", 0)
+                total = val.get("total", 0)
+                remaining = total - used
+                pct = used / total * 100 if total else 0
+                status = "⚠️ 预算紧张" if pct > 85 else ("🟡 注意" if pct > 70 else "✅ 充足")
+                return (
+                    f"【{dept}】预算状况  {status}\n"
+                    f"  年度预算: {total:,.0f} 元\n"
+                    f"  已使用:   {used:,.0f} 元 ({pct:.1f}%)\n"
+                    f"  剩余:     {remaining:,.0f} 元"
+                )
+        return f"未找到部门 [{dept}] 的预算数据。"
+
+    elif name == "get_app_detail":
+        app_id = args["app_id"]
+        app = apps_map.get(app_id)
+        if not app:
+            return f"未找到申请 {app_id}，请确认编号。可用编号：{', '.join(list(apps_map.keys())[:5])}..."
+        items_text = "\n".join(
+            f"  [{item['category']}] {item['amount']}元"
+            f"  {'✓发票' if item.get('has_receipt') else '✗无发票'}"
+            f"  {item.get('note','')}"
+            for item in app.get("expense_items", [])
+        )
+        manager_dec = app.get("manager_decision") or {}
+        finance_dec = app.get("finance_decision") or {}
+        detail = (
+            f"申请编号 : {app['app_id']}\n"
+            f"申请人   : {app.get('applicant','')} ({app.get('department','')} / {app.get('level','')})\n"
+            f"目的地   : {app.get('destination','')}\n"
+            f"出差时间 : {app.get('trip_start','')} ~ {app.get('trip_end','')} ({app.get('trip_days','')}天)\n"
+            f"出差目的 : {app.get('purpose','')}\n"
+            f"提交天数 : 出差后第 {app.get('submitted_days_after_trip','?')} 天\n"
+            f"\n费用明细 :\n{items_text}\n"
+            f"\n合计     : {app.get('total_amount',0)} 元\n"
+            f"票据完整 : {'是' if app.get('has_all_receipts') else '否'}\n"
+            f"各项合规 : {'是' if app.get('all_items_compliant') else '否（有超标项）'}\n"
+            f"申请说明 : {app.get('justification','（无）')}\n"
+        )
+        if manager_dec:
+            detail += f"\n经理初审 : {manager_dec.get('decision','')} — {manager_dec.get('reason','')[:100]}\n"
+        if finance_dec:
+            detail += f"财务终审 : {finance_dec.get('decision','')} — {finance_dec.get('reason','')[:100]}\n"
+        return detail
+
+    elif name == "make_decision":
+        decision_record = {
+            "app_id":   args["app_id"],
+            "decision": args["decision"],
+            "reason":   args["reason"],
+        }
+        decisions.append(decision_record)
+        return (
+            f"✓ 决定已记录：{args['app_id']} → {args['decision']}\n"
+            f"理由: {args['reason'][:100]}..."
+        )
+
+    return f"未知工具: {name}"
+
+
+def _run_review_chat(
+    history: list[dict],
+    user_message: str,
+    tools: list,
+    system_prompt: str,
+    apps_map: dict,
+) -> tuple[str, list[dict]]:
+    """
+    通用审批对话引擎（Agent 2/3 共用）。
+
+    Returns:
+        (reply, decisions)  decisions 是本轮产生的审批决定列表
+    """
+    client = _get_client()
+    decisions: list[dict] = []
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
+    for _ in range(5):  # 允许多次工具调用
+        response = client.chat.completions.create(
+            model="qwen-plus",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.2,
+            max_tokens=2000,
+        )
+        msg = response.choices[0].message
+
+        if msg.tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ],
+            })
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments)
+                result = _execute_review_tool(tc.function.name, args, apps_map, decisions)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            continue
+
+        return msg.content or "", decisions
+
+    return "处理超时，请重试。", decisions
+
+
+def chat_manager(
+    history: list[dict],
+    user_message: str,
+    pending_apps: list[dict],
+    apps_map: dict,
+) -> tuple[str, list[dict]]:
+    """
+    Agent 2 对话入口。
+
+    Args:
+        pending_apps: PENDING_MANAGER 状态的申请列表（含完整字段）
+        apps_map: app_id -> 申请 dict（含 manager_decision / finance_decision）
+
+    Returns:
+        (reply, decisions)
+    """
+    pending_list = _format_pending_list(pending_apps)
+    system_prompt = _build_manager_system_prompt(pending_list)
+    return _run_review_chat(history, user_message, _MANAGER_TOOLS, system_prompt, apps_map)
+
+
+def chat_finance(
+    history: list[dict],
+    user_message: str,
+    pending_apps: list[dict],
+    apps_map: dict,
+) -> tuple[str, list[dict]]:
+    """
+    Agent 3 对话入口。
+
+    Args:
+        pending_apps: PENDING_FINANCE 状态的申请列表
+        apps_map: app_id -> 申请 dict
+
+    Returns:
+        (reply, decisions)
+    """
+    pending_list = _format_pending_list(pending_apps)
+    system_prompt = _build_finance_system_prompt(pending_list)
+    return _run_review_chat(history, user_message, _FINANCE_TOOLS, system_prompt, apps_map)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_app_from_draft(draft: dict, app_id: str) -> dict:
     """将草稿 dict 转为 ApplicationStore 兼容的申请格式。"""
     items = draft.get("expense_items", [])
